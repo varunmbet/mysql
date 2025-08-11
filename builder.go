@@ -442,7 +442,11 @@ func (sb *SQLBuilder) ForUpdate() *SQLBuilder {
 }
 
 // JoinRaw join with raw sql
-func (sb *SQLBuilder) JoinRaw(join string) *SQLBuilder {
+func (sb *SQLBuilder) JoinRaw(join string, args ...interface{}) *SQLBuilder {
+	if strings.Count(join, "?") != len(args) {
+		err := fmt.Sprintf("JoinRaw设置条件[%s]与参数个数不对应", join)
+		panic(err)
+	}
 	var buf strings.Builder
 
 	buf.WriteString(sb._join)
@@ -452,6 +456,9 @@ func (sb *SQLBuilder) JoinRaw(join string) *SQLBuilder {
 	buf.WriteString(join)
 
 	sb._join = buf.String()
+	if len(args) > 0 {
+		sb._param = append(sb._param, args...)
+	}
 	return sb
 }
 
@@ -465,10 +472,7 @@ func (sb *SQLBuilder) OnDku(queryString string, args ...interface{}) *SQLBuilder
 	buf.WriteString(" ON DUPLICATE KEY UPDATE ")
 	buf.WriteString(queryString)
 	if len(args) > 0 {
-		for _, value := range args {
-			sb._param = append(sb._param, value)
-		}
-		//sb._param = append(sb._param, args)
+		sb._param = append(sb._param, args...)
 	}
 	return sb
 }
@@ -808,10 +812,7 @@ func (sb *SQLBuilder) Set(updatestr string, values ...interface{}) *SQLBuilder {
 			sb._update = buf.String()
 		}
 		if len(values) > 0 {
-			for _, value := range values {
-				sb._param = append(sb._param, value)
-			}
-			//sb._param = append(sb._param, values)
+			sb._param = append(sb._param, values...)
 		}
 
 	}
