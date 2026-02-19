@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -81,9 +82,17 @@ func (sb *SQLBuilder) Init(dbmodel *DbModel) {
 
 // 是否 sync.pool,所以sb.tx = nil
 func (sb *SQLBuilder) Free() {
+	// 事务未正常结束时，自动回滚，避免连接/锁泄露
+	// 注意：这里是 best-effort；调用方仍应显式 Commit/Rollback
+	if !sb.isAutoCommit && sb.tx != nil {
+		_ = sb.tx.Rollback()
+		sb.isAutoCommit = true
+	}
 	sb.ReSet()
 	sb.tx = nil
-	sb.dbmodel.PutSb(sb)
+	if sb.dbmodel != nil {
+		sb.dbmodel.PutSb(sb)
+	}
 }
 
 // GetQuerySQL get sql
@@ -328,14 +337,11 @@ func (sb *SQLBuilder) whereIn(operator string, condition string, field string, v
 	//	sb._param = append(sb._param, value)
 	//}
 
-	return sb
 }
 func (sb *SQLBuilder) parseWhereInBySlice(operator string, condition string, field string, m reflect.Value) {
 	knum := m.Len()
 	if knum == 0 {
-		err := fmt.Sprintf("WhereIn 切片[] 长度必须大于0")
-		panic(err)
-		return
+		panic("WhereIn 切片[] 长度必须大于0")
 	}
 	var bufstr strings.Builder
 	bufstr.WriteString(sb._where) // append
@@ -526,9 +532,7 @@ func isEmptyValue(v reflect.Value) bool {
 func (sb *SQLBuilder) setInsetOneByMap(m reflect.Value) { //v
 	knum := m.Len()
 	if knum == 0 {
-		err := fmt.Sprintf("map 长度必须大于0")
-		panic(err)
-		return
+		panic("map 长度必须大于0")
 	}
 	var buf strings.Builder
 	buf.WriteString("(")
@@ -675,9 +679,7 @@ func (sb *SQLBuilder) insertScanMore(dest interface{}) *SQLBuilder {
 func (sb *SQLBuilder) setInsetMoreBystruct(rt reflect.Type, rv reflect.Value) {
 	knum := rv.Len()
 	if knum == 0 {
-		err := fmt.Sprintf("Slice 长度必须大于0")
-		panic(err)
-		return
+		panic("Slice 长度必须大于0")
 	}
 	var buf strings.Builder
 	buf.WriteString("(")
@@ -751,9 +753,7 @@ func (sb *SQLBuilder) setInsetMoreBystruct(rt reflect.Type, rv reflect.Value) {
 func (sb *SQLBuilder) setInsetMoreByMap(m reflect.Value) {
 	knum := m.Len()
 	if knum == 0 {
-		err := fmt.Sprintf("map 长度必须大于0")
-		panic(err)
-		return
+		panic("map 长度必须大于0")
 	}
 	var buf strings.Builder
 	buf.WriteString("(")
@@ -767,9 +767,7 @@ func (sb *SQLBuilder) setInsetMoreByMap(m reflect.Value) {
 		mapValue := m.Index(i)
 		maplen := mapValue.Len() //获取每个切片的长度
 		if maplen == 0 || firstmaplen != maplen {
-			err := fmt.Sprintf("切片中的每个map的长度必须大于0且等同")
-			panic(err)
-			return
+			panic("切片中的每个map的长度必须大于0且等同")
 		}
 		keys := mapValue.MapKeys()
 		for ik, key := range keys {
@@ -801,7 +799,6 @@ func (sb *SQLBuilder) Set(updatestr string, values ...interface{}) *SQLBuilder {
 	if updatestr != "" {
 		if sb._where != "" {
 			panic(errors.New("where语句必须再set之后出现"))
-			return sb
 		}
 		if sb._update == "" {
 			sb._update = "SET " + updatestr
@@ -823,7 +820,6 @@ func (sb *SQLBuilder) Set(updatestr string, values ...interface{}) *SQLBuilder {
 func (sb *SQLBuilder) Sets(dest interface{}) *SQLBuilder {
 	if sb._where != "" {
 		panic(errors.New("where语句必须再set之后出现"))
-		return sb
 	}
 	value := reflect.ValueOf(dest)
 	vtype := reflect.TypeOf(dest)
@@ -848,9 +844,7 @@ func (sb *SQLBuilder) Sets(dest interface{}) *SQLBuilder {
 func (sb *SQLBuilder) setUpdateByMap(m reflect.Value) {
 	knum := m.Len()
 	if knum == 0 {
-		err := fmt.Sprintf("map 长度必须大于0")
-		panic(err)
-		return
+		panic("map 长度必须大于0")
 	}
 	var buf strings.Builder
 	buf.WriteString("Set ")
@@ -1046,19 +1040,21 @@ func (sb *SQLBuilder) QueryRow(sqlstr string, args ...interface{}) (*sql.Row, er
 }
 
 // 查询单行，这里error只提示数据库没有实例
-func (sb *SQLBuilder) _QueryRow(sqlstr string, args ...interface{}) (*sql.Row, error) {
-	defer func() { //捕捉panic错误避免崩溃
+func (sb *SQLBuilder) _QueryRow(sqlstr string, args ...interface{}) (row *sql.Row, err error) {
+	defer func() { // 捕捉panic并转成error，避免静默失败
 		if r := recover(); r != nil {
+			err = fmt.Errorf("QueryRow panic: %v\n%s", r, debug.Stack())
+			sb._Err = err
 		}
 	}()
 	if !sb.isAutoCommit && sb.tx != nil { //事物
-		row := sb.tx.QueryRow(sqlstr, args...)
+		row = sb.tx.QueryRow(sqlstr, args...)
 		return row, nil
 	} else {
-		if dbReader == nil { //如果数据库实例未能获取到，返回空列表
+		if sb.dbmodel == nil || sb.dbmodel.reader == nil { //如果数据库实例未能获取到，返回空列表
 			return nil, errors.New("从数据库未能获取到实例")
 		}
-		row := dbReader.QueryRow(sqlstr, args...)
+		row = sb.dbmodel.reader.QueryRow(sqlstr, args...)
 		return row, nil
 	}
 }
@@ -1072,18 +1068,20 @@ func (sb *SQLBuilder) Query(sqlstr string, args ...interface{}) (*sql.Rows, erro
 	return sb._Query(sqlstr, args...)
 }
 
-func (sb *SQLBuilder) _Query(sqlstr string, args ...interface{}) (*sql.Rows, error) {
-	defer func() { //捕捉panic错误避免崩溃
+func (sb *SQLBuilder) _Query(sqlstr string, args ...interface{}) (rows *sql.Rows, err error) {
+	defer func() { // 捕捉panic并转成error，避免静默失败
 		if r := recover(); r != nil {
+			err = fmt.Errorf("Query panic: %v\n%s", r, debug.Stack())
+			sb._Err = err
 		}
 	}()
 	if !sb.isAutoCommit && sb.tx != nil { //事物
 		return sb.tx.Query(sqlstr, args...)
 	} else {
-		if dbReader == nil { //如果数据库实例未能获取到，返回空列表
+		if sb.dbmodel == nil || sb.dbmodel.reader == nil { //如果数据库实例未能获取到，返回空列表
 			return nil, errors.New("从数据库未能获取到实例")
 		}
-		return dbReader.Query(sqlstr, args...)
+		return sb.dbmodel.reader.Query(sqlstr, args...)
 	}
 	/*stmp, err := sb.dbReader.Prepare(sqlstr)
 	if err != nil {
@@ -1094,9 +1092,11 @@ func (sb *SQLBuilder) _Query(sqlstr string, args ...interface{}) (*sql.Rows, err
 }
 
 // 数据库修改操作（insert/update/delete） 主数据库
-func (sb *SQLBuilder) Execute(sqlstr string, args ...interface{}) (sql.Result, error) {
-	defer func() { //捕捉panic错误避免崩溃
+func (sb *SQLBuilder) Execute(sqlstr string, args ...interface{}) (res sql.Result, err error) {
+	defer func() { // 捕捉panic并转成error，避免静默失败
 		if r := recover(); r != nil {
+			err = fmt.Errorf("Execute panic: %v\n%s", r, debug.Stack())
+			sb._Err = err
 		}
 	}()
 	if !sb.isAutoCommit && sb.tx != nil { //事物
@@ -1108,7 +1108,10 @@ func (sb *SQLBuilder) Execute(sqlstr string, args ...interface{}) (sql.Result, e
 		return stmt.Exec(args...)
 
 	} else {
-		stmt, err := dbWriter.Prepare(sqlstr)
+		if sb.dbmodel == nil || sb.dbmodel.writer == nil {
+			return nil, errors.New("主数据库未能获取到实例")
+		}
+		stmt, err := sb.dbmodel.writer.Prepare(sqlstr)
 		if err != nil {
 			return nil, err
 		}
@@ -1118,15 +1121,20 @@ func (sb *SQLBuilder) Execute(sqlstr string, args ...interface{}) (sql.Result, e
 }
 
 // 数据库修改操作（insert/update/delete） 主数据库
-func (sb *SQLBuilder) Exec(sqlstr string, args ...interface{}) (sql.Result, error) {
-	defer func() { //捕捉panic错误避免崩溃
+func (sb *SQLBuilder) Exec(sqlstr string, args ...interface{}) (res sql.Result, err error) {
+	defer func() { // 捕捉panic并转成error，避免静默失败
 		if r := recover(); r != nil {
+			err = fmt.Errorf("Exec panic: %v\n%s", r, debug.Stack())
+			sb._Err = err
 		}
 	}()
 	if !sb.isAutoCommit && sb.tx != nil { //事物
 		return sb.tx.Exec(sqlstr, args...)
 	} else {
-		return dbWriter.Exec(sqlstr, args...)
+		if sb.dbmodel == nil || sb.dbmodel.writer == nil {
+			return nil, errors.New("主数据库未能获取到实例")
+		}
+		return sb.dbmodel.writer.Exec(sqlstr, args...)
 	}
 }
 
@@ -1148,7 +1156,7 @@ func (sb *SQLBuilder) Get(dest ...interface{}) error {
 		//defer sb.ReSet()
 		rows, err := sb._Query(sqlstr, params...)
 		if err != nil {
-			return nil
+			return err
 		}
 		r := &Row{rows: rows, err: err, unsafe: sb.unsafe, Mapper: sb.Mapper}
 		return r.Scan(dest...)
@@ -1384,7 +1392,13 @@ func (sb *SQLBuilder) Run(txFunc func() (interface{}, error)) (interface{}, erro
 // Begin() 后要手工调用free函数
 func (sb *SQLBuilder) Begin() (*SQLBuilder, error) {
 	var err error
-	sb.tx, err = dbWriter.Begin()
+	if !sb.isAutoCommit && sb.tx != nil {
+		return sb, errors.New("事务已开启，禁止重复 begin")
+	}
+	if sb.dbmodel == nil || sb.dbmodel.writer == nil {
+		return sb, errors.New("主数据库未能获取到实例")
+	}
+	sb.tx, err = sb.dbmodel.writer.Begin()
 	if err != nil {
 		return sb, err
 	}
@@ -1394,20 +1408,29 @@ func (sb *SQLBuilder) Begin() (*SQLBuilder, error) {
 
 func (sb *SQLBuilder) Rollback() (*SQLBuilder, error) {
 	if !sb.isAutoCommit && sb.tx != nil {
-		sb.isAutoCommit = true
 		defer sb.Log.ShowLog()
-		return sb, sb.tx.Rollback()
+		err := sb.tx.Rollback()
+		sb.isAutoCommit = true
+		sb.tx = nil
+		return sb, err
 	}
 	return sb, errors.New("数据库事物必须先调用begin函数")
 }
 
 func (sb *SQLBuilder) Commit() (*SQLBuilder, error) {
 	if !sb.isAutoCommit && sb.tx != nil {
-		sb.isAutoCommit = true
 		defer sb.Log.ShowLog()
-		return sb, sb.tx.Commit()
+		err := sb.tx.Commit()
+		sb.isAutoCommit = true
+		sb.tx = nil
+		return sb, err
 	}
 	return sb, errors.New("数据库事物必须先调用begin函数")
+}
+
+// InTx reports whether the builder is currently in an active transaction.
+func (sb *SQLBuilder) InTx() bool {
+	return sb != nil && !sb.isAutoCommit && sb.tx != nil
 }
 
 // GenPlaceholders generate placeholders
