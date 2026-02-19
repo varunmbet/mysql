@@ -127,6 +127,8 @@ for rows.Next() {
 }
 ```
 
+> 性能建议：分页场景请配合 `Limit(offset, num)` 使用；库内部会基于 `Limit` 对 `FindList` 的目标 slice 进行预扩容，减少扩容拷贝与 GC 压力。
+
 #### 3) 写入（Insert/IgnoreInsert/ReplaceInsert）
 
 ```go

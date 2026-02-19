@@ -253,10 +253,7 @@ func (sb *SQLBuilder) Where(queryString string, args ...interface{}) *SQLBuilder
 	}
 	sb._where = buf.String()
 	if len(args) > 0 {
-		for _, value := range args {
-			sb._param = append(sb._param, value)
-		}
-		//sb._param = append(sb._param, args...)
+		sb._param = append(sb._param, args...)
 	}
 	return sb
 }
@@ -311,9 +308,7 @@ func (sb *SQLBuilder) whereIn(operator string, condition string, field string, v
 				buf.WriteString("(")
 				buf.WriteString(plhs)
 				buf.WriteString(")")
-				for _, value := range values {
-					sb._param = append(sb._param, value)
-				}
+				sb._param = append(sb._param, values...)
 			}
 			sb._where = buf.String()
 		}
@@ -412,10 +407,7 @@ func (sb *SQLBuilder) Having(havingstr string, args ...interface{}) *SQLBuilder 
 
 	sb._having = buf.String()
 	if len(args) > 0 {
-		for _, value := range args {
-			sb._param = append(sb._param, value)
-		}
-		//sb._param = append(sb._param, args)
+		sb._param = append(sb._param, args...)
 	}
 	return sb
 }
@@ -439,6 +431,27 @@ func (sb *SQLBuilder) Limit(offset, num int) *SQLBuilder {
 	//limit 0,1
 	sb._limit = buf.String()
 	return sb
+}
+
+// limitHint tries to extract the "num" from " LIMIT offset,num" for preallocation.
+// Returns 0 when limit is not set or cannot be parsed.
+func (sb *SQLBuilder) limitHint() int {
+	lim := strings.TrimSpace(sb._limit)
+	if lim == "" {
+		return 0
+	}
+	lim = strings.TrimPrefix(lim, "LIMIT")
+	lim = strings.TrimPrefix(lim, "limit")
+	lim = strings.TrimSpace(lim)
+	parts := strings.Split(lim, ",")
+	if len(parts) != 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // ForUpdate SQLSegments
@@ -1206,6 +1219,13 @@ func (sb *SQLBuilder) FindList(dest interface{}) error {
 	vtype := reflect.TypeOf(dest)
 	//rt := rv.Type()
 	if vtype.Kind() == reflect.Ptr && value.Type().Elem().Kind() == reflect.Slice {
+		// 预扩容：当使用 Limit 时，可显著减少 slice 扩容拷贝成本
+		if hint := sb.limitHint(); hint > 0 {
+			direct := reflect.Indirect(value)
+			if direct.Kind() == reflect.Slice && direct.Cap() < hint {
+				direct.Set(reflect.MakeSlice(direct.Type(), 0, hint))
+			}
+		}
 		sb._methodtype = 6
 		sqlstr, params, err := sb.getSql()
 		if err != nil {
