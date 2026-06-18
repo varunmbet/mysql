@@ -411,6 +411,26 @@ func baseType(t reflect.Type, expected reflect.Kind) (reflect.Type, error) {
 // when iterating over many rows.  Empty traversals will get an interface pointer.
 // Because of the necessity of requesting ptrs or values, it's considered a bit too
 // specialized for inclusion in reflectx itself.
+// byteSliceScanner 让 []byte / json.RawMessage 等字节切片字段能容忍 SQL NULL：
+// NULL 时置为 nil，避免 database/sql 报 "storing driver.Value type <nil> into *json.RawMessage"。
+type byteSliceScanner struct{ target reflect.Value }
+
+func (s byteSliceScanner) Scan(src interface{}) error {
+	switch v := src.(type) {
+	case nil:
+		s.target.SetBytes(nil)
+	case []byte:
+		b := make([]byte, len(v))
+		copy(b, v)
+		s.target.SetBytes(b)
+	case string:
+		s.target.SetBytes([]byte(v))
+	default:
+		return fmt.Errorf("byteSliceScanner: 不支持的源类型 %T", src)
+	}
+	return nil
+}
+
 func fieldsByTraversal(v reflect.Value, traversals [][]int, values []interface{}, ptrs bool) error {
 	v = reflect.Indirect(v)
 	if v.Kind() != reflect.Struct {
@@ -424,7 +444,13 @@ func fieldsByTraversal(v reflect.Value, traversals [][]int, values []interface{}
 		}
 		f := reflectx.FieldByIndexes(v, traversal)
 		if ptrs {
-			values[i] = f.Addr().Interface()
+			// 字节切片字段（[]byte / json.RawMessage 等）用 NULL 容错扫描器包装，
+			// 否则列为 NULL 时 rows.Scan 会因无法赋值给 *[]byte 而报错。
+			if f.Kind() == reflect.Slice && f.Type().Elem().Kind() == reflect.Uint8 && f.CanSet() {
+				values[i] = byteSliceScanner{target: f}
+			} else {
+				values[i] = f.Addr().Interface()
+			}
 		} else {
 			values[i] = f.Interface()
 		}

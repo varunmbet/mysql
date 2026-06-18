@@ -126,13 +126,18 @@ func (m *DbModel) Close() error {
 	return err2
 }
 
+// GetDb 返回底层写库 *sql.DB，用于 DDL（建表/迁移）等高级用法。
+func (m *DbModel) GetDb() *sql.DB {
+	if m == nil {
+		return nil
+	}
+	return m.writer
+}
+
 func (m *DbModel) Orm() *SQLBuilder {
-	//defer m.pool.Put(sb)
-	return m.pool.Get().(*SQLBuilder) //sbpool.Get().(*SQLBuilder) //NewSQLBuilder(m) //m.pool.Get().(*SQLBuilder)
-	//defer m.pool.Put(sb)
-	//return sb
-	//m.sb.ReSet()
-	//return m.sb
+	sb := m.pool.Get().(*SQLBuilder)
+	sb.inPool = false // 取出后标记“在用”，配合 Free 的幂等保护避免重复入池
+	return sb
 }
 
 func (m *DbModel) PutSb(sb *SQLBuilder) {

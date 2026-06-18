@@ -63,6 +63,8 @@ type SQLBuilder struct {
 	_Err   error  //日志使用
 	_Debug bool   //是否调试
 	Log    *sqllog
+
+	inPool bool // true 表示已归还连接池；防止同一 builder 被重复入池后被多个 goroutine 共享
 }
 
 // NewSQLBuilder init sql builder
@@ -82,6 +84,11 @@ func (sb *SQLBuilder) Init(dbmodel *DbModel) {
 
 // 是否 sync.pool,所以sb.tx = nil
 func (sb *SQLBuilder) Free() {
+	// 幂等：已归还池的 builder 再次 Free 直接忽略，避免同一对象被重复 Put 进 sync.Pool，
+	// 否则两个 goroutine 可能 Get 到同一 builder，导致 where/参数互相串扰。
+	if sb.inPool {
+		return
+	}
 	// 事务未正常结束时，自动回滚，避免连接/锁泄露
 	// 注意：这里是 best-effort；调用方仍应显式 Commit/Rollback
 	if !sb.isAutoCommit && sb.tx != nil {
@@ -90,6 +97,7 @@ func (sb *SQLBuilder) Free() {
 	}
 	sb.ReSet()
 	sb.tx = nil
+	sb.inPool = true
 	if sb.dbmodel != nil {
 		sb.dbmodel.PutSb(sb)
 	}
@@ -490,6 +498,7 @@ func (sb *SQLBuilder) OnDku(queryString string, args ...interface{}) *SQLBuilder
 	var buf strings.Builder
 	buf.WriteString(" ON DUPLICATE KEY UPDATE ")
 	buf.WriteString(queryString)
+	sb._dkuStr = buf.String()
 	if len(args) > 0 {
 		sb._param = append(sb._param, args...)
 	}
@@ -562,8 +571,8 @@ func (sb *SQLBuilder) setInsetOneByMap(m reflect.Value) { //v
 			buf.WriteString(",")
 			valuebuf.WriteString(",")
 		}
-		value := m.MapIndex(key).Interface().(string)
-		sb._param = append(sb._param, value)
+		// 原实现硬断言为 string，遇到 int64 等会 panic；直接以原始类型作为占位参数。
+		sb._param = append(sb._param, m.MapIndex(key).Interface())
 	}
 	valuebuf.WriteString(")")
 	sb._insert = buf.String() + valuebuf.String()
@@ -794,8 +803,8 @@ func (sb *SQLBuilder) setInsetMoreByMap(m reflect.Value) {
 			if ik != maplen-1 {
 				valuebuf.WriteString(",")
 			}
-			value := mapValue.MapIndex(key).Interface().(string)
-			sb._param = append(sb._param, value)
+			// 原实现硬断言为 string，遇到 int64 等会 panic；直接以原始类型作为占位参数。
+			sb._param = append(sb._param, mapValue.MapIndex(key).Interface())
 		}
 		if i == knum-1 {
 			valuebuf.WriteString(")")
@@ -868,8 +877,8 @@ func (sb *SQLBuilder) setUpdateByMap(m reflect.Value) {
 		if i != knum-1 {
 			buf.WriteString(",")
 		}
-		value := m.MapIndex(key).Interface().(string)
-		sb._param = append(sb._param, value)
+		// 原实现硬断言为 string，遇到 int64 等会 panic；直接以原始类型作为占位参数。
+		sb._param = append(sb._param, m.MapIndex(key).Interface())
 	}
 	if sb._update == "" {
 		sb._update = buf.String()
@@ -1674,6 +1683,15 @@ func (sb *SQLBuilder) FindListNew1(dest interface{}) error {
 					}
 					newValue = x
 
+				case reflect.Slice:
+					// []byte / json.RawMessage 等字节切片：JSON/TEXT/BLOB 列按原始字节读取
+					if field.Type.Elem().Kind() == reflect.Uint8 {
+						b := make([]byte, len(col))
+						copy(b, col)
+						newValue = reflect.ValueOf(b).Convert(field.Type).Interface()
+					} else {
+						return errors.New("不支持的Slice元素类型: " + field.Type.Elem().Kind().String())
+					}
 				default:
 					return errors.New("未发现可以支持的类型: " + reflect.TypeOf(newValue).String())
 				}
@@ -1864,6 +1882,13 @@ func MapToStruct(m map[string]string, to interface{}) error {
 				}
 				newValue = x
 
+			case reflect.Slice:
+				// []byte / json.RawMessage 等字节切片：JSON/TEXT/BLOB 列按原始字节读取
+				if field.Type.Elem().Kind() == reflect.Uint8 {
+					newValue = reflect.ValueOf([]byte(dbValue)).Convert(field.Type).Interface()
+				} else {
+					return errors.New("不支持的Slice元素类型: " + field.Type.Elem().Kind().String())
+				}
 			default:
 				return errors.New("未发现可以支持的类型: " + reflect.TypeOf(newValue).String())
 			}
