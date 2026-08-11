@@ -782,8 +782,15 @@ func (sb *SQLBuilder) setInsetMoreByMap(m reflect.Value) {
 	var valuebuf strings.Builder
 	valuebuf.WriteString(") VALUES (")
 
-	// 遍历切片中的每个map
-	firstmaplen := m.Index(0).Len() //获取每个切片的长度
+	// 以第一个 map 的键序为准，固定列顺序。
+	// Go 的 map 遍历顺序是随机的，若每行各按自身遍历序追加参数，会与列名错位导致数据串位。
+	first := m.Index(0)
+	firstmaplen := first.Len()
+	orderedKeys := make([]reflect.Value, 0, firstmaplen)
+	for _, key := range first.MapKeys() {
+		orderedKeys = append(orderedKeys, key)
+	}
+
 	for i := 0; i < knum; i++ {
 		// 获取切片中的每个map的值
 		mapValue := m.Index(i)
@@ -791,20 +798,25 @@ func (sb *SQLBuilder) setInsetMoreByMap(m reflect.Value) {
 		if maplen == 0 || firstmaplen != maplen {
 			panic("切片中的每个map的长度必须大于0且等同")
 		}
-		keys := mapValue.MapKeys()
-		for ik, key := range keys {
-			if i == 0 { //第一个切片
+		for ik, key := range orderedKeys {
+			if i == 0 { //第一个切片，构造列名
+				buf.WriteString("`")
 				buf.WriteString(key.String())
-				if ik < maplen-1 {
+				buf.WriteString("`")
+				if ik < firstmaplen-1 {
 					buf.WriteString(",")
 				}
 			}
 			valuebuf.WriteString("?")
-			if ik != maplen-1 {
+			if ik != firstmaplen-1 {
 				valuebuf.WriteString(",")
 			}
-			// 原实现硬断言为 string，遇到 int64 等会 panic；直接以原始类型作为占位参数。
-			sb._param = append(sb._param, mapValue.MapIndex(key).Interface())
+			val := mapValue.MapIndex(key)
+			if !val.IsValid() { //各行必须包含相同的键，否则会错位
+				panic("切片中的每个map必须包含相同的键: " + key.String())
+			}
+			// 直接以原始类型作为占位参数（支持 int64/float 等，不强制 string）。
+			sb._param = append(sb._param, val.Interface())
 		}
 		if i == knum-1 {
 			valuebuf.WriteString(")")
