@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,7 +52,14 @@ type SQLBuilder struct {
 	_forUpdate   bool
 	_dkuStr      string
 	_methodtype  int
-	_param       []interface{}
+	_param       []interface{} // 最近一次生成的完整参数列表（日志使用）
+	// 各子句的参数分开保存，生成 SQL 时按子句在语句中的顺序拼接，因此链式调用的先后顺序不影响参数对应关系。
+	_joinParam   []interface{}
+	_whereParam  []interface{}
+	_havingParam []interface{}
+	_setParam    []interface{}
+	_insertParam []interface{}
+	_dkuParam    []interface{}
 	dbmodel      *DbModel
 	unsafe       bool
 	Mapper       *reflectx.Mapper
@@ -69,7 +77,7 @@ type SQLBuilder struct {
 
 // NewSQLBuilder init sql builder
 func NewSQLBuilder(dbmodel *DbModel, debug bool) *SQLBuilder {
-	sb := &SQLBuilder{dbmodel: dbmodel, _Debug: debug, driverName: "mysql", unsafe: true, Mapper: mapper(), isAutoCommit: true}
+	sb := &SQLBuilder{dbmodel: dbmodel, _Debug: debug, driverName: "mysql", unsafe: true, Mapper: mapper(), isAutoCommit: true, _methodtype: MethodSelect}
 	sb.Log = NewSqlLog(sb)
 	return sb
 
@@ -82,10 +90,11 @@ func (sb *SQLBuilder) Init(dbmodel *DbModel) {
 	sb.Mapper = mapper()
 }
 
-// 是否 sync.pool,所以sb.tx = nil
+// Free 把 builder 归还对象池（事务未结束时先回滚）。只由取得它的一方调用一次：Orm() 的调用方，或 Transaction。
+// 查询、增删改方法执行完只清空构建状态（ReSet），不会自行归还：否则调用方随后的 Free 可能作用在
+// 已被别的 goroutine 从池中取走、正在事务中的同一对象上，把它的事务回滚并再次放回池。
 func (sb *SQLBuilder) Free() {
-	// 幂等：已归还池的 builder 再次 Free 直接忽略，避免同一对象被重复 Put 进 sync.Pool，
-	// 否则两个 goroutine 可能 Get 到同一 builder，导致 where/参数互相串扰。
+	// 同一持有者重复 Free 时直接忽略，避免同一对象被重复 Put 进 sync.Pool。
 	if sb.inPool {
 		return
 	}
@@ -223,9 +232,30 @@ func (sb *SQLBuilder) GetDeleteSQL() (string, error) {
 	return buf.String(), nil
 }
 
-// GetQueryParams get params
+// GetQueryParams 按当前语句类型返回与占位符顺序一致的参数
 func (sb *SQLBuilder) GetQueryParams() []interface{} {
-	return sb._param
+	var parts [][]interface{}
+	switch sb._methodtype {
+	case MethodInsert:
+		parts = [][]interface{}{sb._insertParam, sb._dkuParam}
+	case MethodIgnoreInsert, MethodReplaceInsert:
+		parts = [][]interface{}{sb._insertParam}
+	case MethodUpdate:
+		parts = [][]interface{}{sb._setParam, sb._whereParam}
+	case MethodDelete:
+		parts = [][]interface{}{sb._whereParam}
+	default:
+		parts = [][]interface{}{sb._joinParam, sb._whereParam, sb._havingParam}
+	}
+	n := 0
+	for _, p := range parts {
+		n += len(p)
+	}
+	params := make([]interface{}, 0, n)
+	for _, p := range parts {
+		params = append(params, p...)
+	}
+	return params
 }
 
 // Table set table
@@ -261,7 +291,7 @@ func (sb *SQLBuilder) Where(queryString string, args ...interface{}) *SQLBuilder
 	}
 	sb._where = buf.String()
 	if len(args) > 0 {
-		sb._param = append(sb._param, args...)
+		sb._whereParam = append(sb._whereParam, args...)
 	}
 	return sb
 }
@@ -286,91 +316,47 @@ func (sb *SQLBuilder) OrWhereNotIn(field string, values ...interface{}) *SQLBuil
 	return sb.whereIn("OR", "NOT IN", field, values...)
 }
 
+// whereIn 接受多个值，或单个切片/切片指针。值为空时生成恒假(IN)/恒真(NOT IN)条件，
+// 不能只写字段名：那样 "WHERE id" 会匹配所有非零行，Delete/Update 时会误伤整表。
 func (sb *SQLBuilder) whereIn(operator string, condition string, field string, values ...interface{}) *SQLBuilder {
-	if len(values) > 0 {
-		value := reflect.ValueOf(values[0])
-		if value.Kind() == reflect.Ptr {
-			elemType := value.Type().Elem()
-			if elemType.Kind() == reflect.Slice {
-				PtrValue := reflect.Indirect(value)
-				sb.parseWhereInBySlice(operator, condition, field, PtrValue)
-			}
-		} else if value.Kind() == reflect.Slice { //map
-			sb.parseWhereInBySlice(operator, condition, field, value)
-		} else { //多个参数
-			var buf strings.Builder
-			buf.WriteString(sb._where) // append
-			if buf.Len() == 0 {
-				buf.WriteString("WHERE ")
-			} else {
-				buf.WriteString(" ")
-				buf.WriteString(operator)
-				buf.WriteString(" ")
-			}
-			buf.WriteString(field)
-			if len(values) > 0 {
-				plhs := GenPlaceholders(len(values))
-				buf.WriteString(" ")
-				buf.WriteString(condition)
-				buf.WriteString(" ")
-				buf.WriteString("(")
-				buf.WriteString(plhs)
-				buf.WriteString(")")
-				sb._param = append(sb._param, values...)
-			}
-			sb._where = buf.String()
+	if len(values) == 1 {
+		v := reflect.ValueOf(values[0])
+		for v.Kind() == reflect.Ptr && !v.IsNil() {
+			v = v.Elem()
 		}
-		return sb
+		if (v.Kind() == reflect.Slice || v.Kind() == reflect.Array) && v.Type().Elem().Kind() != reflect.Uint8 {
+			values = make([]interface{}, v.Len())
+			for i := range values {
+				values[i] = v.Index(i).Interface()
+			}
+		}
+	}
+	var buf strings.Builder
+	buf.WriteString(sb._where) // append
+	if buf.Len() == 0 {
+		buf.WriteString("WHERE ")
 	} else {
-		var buf strings.Builder
-		buf.WriteString(sb._where) // append
-		if buf.Len() == 0 {
-			buf.WriteString("WHERE ")
+		buf.WriteString(" ")
+		buf.WriteString(operator)
+		buf.WriteString(" ")
+	}
+	if len(values) == 0 {
+		if condition == "IN" {
+			buf.WriteString("1=0")
 		} else {
-			buf.WriteString(" ")
-			buf.WriteString(operator)
-			buf.WriteString(" ")
+			buf.WriteString("1=1")
 		}
-		buf.WriteString(field)
-		sb._where = buf.String()
-		return sb
-	}
-
-	//for _, value := range values {
-	//	sb._param = append(sb._param, value)
-	//}
-
-}
-func (sb *SQLBuilder) parseWhereInBySlice(operator string, condition string, field string, m reflect.Value) {
-	knum := m.Len()
-	if knum == 0 {
-		panic("WhereIn 切片[] 长度必须大于0")
-	}
-	var bufstr strings.Builder
-	bufstr.WriteString(sb._where) // append
-	if bufstr.Len() == 0 {
-		bufstr.WriteString("WHERE ")
 	} else {
-		bufstr.WriteString(" ")
-		bufstr.WriteString(operator)
-		bufstr.WriteString(" ")
+		buf.WriteString(field)
+		buf.WriteString(" ")
+		buf.WriteString(condition)
+		buf.WriteString(" (")
+		buf.WriteString(GenPlaceholders(len(values)))
+		buf.WriteString(")")
+		sb._whereParam = append(sb._whereParam, values...)
 	}
-	bufstr.WriteString(field)
-	if knum > 0 {
-		plhs := GenPlaceholders(knum)
-		bufstr.WriteString(" ")
-		bufstr.WriteString(condition)
-		bufstr.WriteString(" ")
-		bufstr.WriteString("(")
-		bufstr.WriteString(plhs)
-		bufstr.WriteString(")")
-		// 遍历切片并获取每个元素的值
-		for i := 0; i < knum; i++ {
-			element := m.Index(i).Interface()
-			sb._param = append(sb._param, element)
-		}
-	}
-	sb._where = bufstr.String()
+	sb._where = buf.String()
+	return sb
 }
 
 // GroupBy set group by fields
@@ -393,13 +379,10 @@ func (sb *SQLBuilder) GroupBy(fields ...string) *SQLBuilder {
 	return sb
 }
 
-// 分组条件 Having("Gender>0") //必须配合group使用
+// 分组条件 Having("Gender>0")，多次调用以 AND 连接；可在 GroupBy 之前或之后调用
 func (sb *SQLBuilder) Having(havingstr string, args ...interface{}) *SQLBuilder {
-	if sb._groupBy == "" { // group by not set
-		return sb
-	}
 	if strings.Count(havingstr, "?") != len(args) {
-		err := fmt.Sprintf("查询条件[%s]与参数个数不对应", args)
+		err := fmt.Sprintf("Having条件[%s]与参数个数不对应", havingstr)
 		panic(err)
 	}
 	var buf strings.Builder
@@ -408,14 +391,14 @@ func (sb *SQLBuilder) Having(havingstr string, args ...interface{}) *SQLBuilder 
 
 	if buf.Len() == 0 {
 		buf.WriteString("HAVING ")
-		buf.WriteString(havingstr)
 	} else {
-		buf.WriteString(havingstr)
+		buf.WriteString(" AND ")
 	}
+	buf.WriteString(havingstr)
 
 	sb._having = buf.String()
 	if len(args) > 0 {
-		sb._param = append(sb._param, args...)
+		sb._havingParam = append(sb._havingParam, args...)
 	}
 	return sb
 }
@@ -484,12 +467,12 @@ func (sb *SQLBuilder) JoinRaw(join string, args ...interface{}) *SQLBuilder {
 
 	sb._join = buf.String()
 	if len(args) > 0 {
-		sb._param = append(sb._param, args...)
+		sb._joinParam = append(sb._joinParam, args...)
 	}
 	return sb
 }
 
-// on duplicate key update设置 OnDku("Uid = ? and user_name=?", 1, "admin")
+// on duplicate key update设置 OnDku("Uid = ? and user_name=?", 1, "admin")，只对 Insert 生效；重复调用以最后一次为准
 func (sb *SQLBuilder) OnDku(queryString string, args ...interface{}) *SQLBuilder {
 	if strings.Count(queryString, "?") != len(args) {
 		err := fmt.Sprintf("OnDku设置条件[%s]与参数个数不对应", queryString)
@@ -499,9 +482,7 @@ func (sb *SQLBuilder) OnDku(queryString string, args ...interface{}) *SQLBuilder
 	buf.WriteString(" ON DUPLICATE KEY UPDATE ")
 	buf.WriteString(queryString)
 	sb._dkuStr = buf.String()
-	if len(args) > 0 {
-		sb._param = append(sb._param, args...)
-	}
+	sb._dkuParam = append(sb._dkuParam[:0:0], args...)
 	return sb
 }
 
@@ -551,6 +532,56 @@ func isEmptyValue(v reflect.Value) bool {
 	}
 	return false
 }
+func mapKeyName(k reflect.Value) string {
+	if k.Kind() == reflect.String {
+		return k.String()
+	}
+	return fmt.Sprint(k.Interface())
+}
+
+// sortedMapKeys 固定 map 的列顺序：SQL 文本稳定，多行插入时各行也按同一列序取值
+func sortedMapKeys(m reflect.Value) []reflect.Value {
+	keys := m.MapKeys()
+	sort.Slice(keys, func(i, j int) bool { return mapKeyName(keys[i]) < mapKeyName(keys[j]) })
+	return keys
+}
+
+// dbField 返回结构体字段对应的列名；非数据库字段、auto:"1" 自动字段、未导出字段返回 ""
+func dbField(field reflect.StructField) string {
+	if !field.IsExported() || strings.TrimSpace(field.Tag.Get("auto")) == "1" {
+		return ""
+	}
+	return field.Tag.Get("field")
+}
+
+// structFieldValue 返回结构体字段写入数据库时的参数，skip=true 表示本次不写该字段。
+// 零值默认跳过；keepZero（empty:"1" 标签或多行插入）时零值照常写入，time.Time 零值写 NULL（type:"int" 写 0）。
+// type 标签：date / datetime / timestamp 按字符串写，int 写 unix 秒，未设置则把 time.Time 交给驱动处理。
+func structFieldValue(field reflect.StructField, fv reflect.Value, keepZero bool) (param interface{}, skip bool) {
+	if !keepZero && fv.IsZero() {
+		return nil, true
+	}
+	if t, ok := fv.Interface().(time.Time); ok {
+		tagType := field.Tag.Get("type")
+		if t.IsZero() {
+			if tagType == "int" {
+				return int64(0), false
+			}
+			return nil, false
+		}
+		switch tagType {
+		case "date":
+			return t.Format("2006-01-02"), false
+		case "datetime", "timestamp":
+			return t.Format("2006-01-02T15:04:05.999999999"), false
+		case "int":
+			return t.Unix(), false
+		}
+		return t, false
+	}
+	return fv.Interface(), false
+}
+
 func (sb *SQLBuilder) setInsetOneByMap(m reflect.Value) { //v
 	knum := m.Len()
 	if knum == 0 {
@@ -561,111 +592,63 @@ func (sb *SQLBuilder) setInsetOneByMap(m reflect.Value) { //v
 	var valuebuf strings.Builder
 	valuebuf.WriteString(") VALUES (")
 
-	keys := m.MapKeys()
-	for i, key := range keys {
-		buf.WriteString("`")
-		buf.WriteString(key.String())
-		buf.WriteString("`")
-		valuebuf.WriteString("?")
-		if i != knum-1 {
+	sb._insertParam = make([]interface{}, 0, knum)
+	for i, key := range sortedMapKeys(m) {
+		if i > 0 {
 			buf.WriteString(",")
 			valuebuf.WriteString(",")
 		}
-		// 原实现硬断言为 string，遇到 int64 等会 panic；直接以原始类型作为占位参数。
-		sb._param = append(sb._param, m.MapIndex(key).Interface())
+		buf.WriteString("`")
+		buf.WriteString(mapKeyName(key))
+		buf.WriteString("`")
+		valuebuf.WriteString("?")
+		sb._insertParam = append(sb._insertParam, m.MapIndex(key).Interface())
 	}
 	valuebuf.WriteString(")")
 	sb._insert = buf.String() + valuebuf.String()
-
 }
 
 // 获取struct的标签并设置SQLBuilder.FieldMap及SQLBuilder.TableName
 func (sb *SQLBuilder) setInsetOneBystruct(rt reflect.Type, rv reflect.Value) {
 	var buf strings.Builder
-	buf.WriteString("(")
 	var valuebuf strings.Builder
-	valuebuf.WriteString(") VALUES (")
 
-	fieldNum := rt.NumField()
-
-	hasValueNum := 0 //是否有设置值
-
-	for i := 0; i < fieldNum; i++ {
+	sb._insertParam = sb._insertParam[:0:0]
+	hasValueNum := 0
+	for i := 0; i < rt.NumField(); i++ {
 		field := rt.Field(i)
-		val := rv.Field(i).Interface()
-		tagField := field.Tag.Get("field")
-		//tagKey := field.Tag.Get("key")
-		tagTable := field.Tag.Get("table")
-		tagType := field.Tag.Get("type")
-		tagIsAuto := strings.Trim(field.Tag.Get("auto"), " ") //是否为数据库自动字段
-		tagallowempty := field.Tag.Get("empty")
-		if tagField != "" && tagIsAuto != "1" { //不属于数据库字段不添加到字段值列表,没设置值的不添加 //字段赋值,非自增主键
-			if tagallowempty != "1" && rv.Field(i).IsZero() {
-				continue //字段不能为空 但值却为空则跳过
-			}
-
-			if tagallowempty == "1" && rv.Field(i).IsZero() {
-				continue //字段可用为空且值也为空则跳过
-			}
-
-			if field.Type.Kind() == reflect.Struct && field.Type.String() == "time.Time" { //time类型
-				fieldTime := val.(time.Time)
-				if !fieldTime.IsZero() {
-					if tagType == "date" { //date方式
-						sb._param = append(sb._param, fieldTime.Format("2006-01-02"))
-					} else if (tagType == "datetime") || (tagType == "timestamp") { //datetime timestamp方式
-						//sb._param = append(sb._param, fieldTime.Format(time.RFC3339Nano))
-						sb._param = append(sb._param, fieldTime.Format("2006-01-02T15:04:05.999999999"))
-					} else if tagType == "int" { //uinx时间戳方式
-						sb._param = append(sb._param, fieldTime.Unix())
-					}
-					hasValueNum++
-					//构造字段表map
-					if hasValueNum != 1 {
-						buf.WriteString(",")
-						valuebuf.WriteString(",")
-					}
-					var fmField string = tagField
-					buf.WriteString("`")
-					buf.WriteString(fmField)
-					buf.WriteString("`")
-					valuebuf.WriteString("?")
-				}
-			} else {
-				hasValueNum++
-				//构造字段表map
-				if hasValueNum != 1 {
-					buf.WriteString(",")
-					valuebuf.WriteString(",")
-				}
-				var fmField string = tagField
-				buf.WriteString("`")
-				buf.WriteString(fmField)
-				buf.WriteString("`")
-				valuebuf.WriteString("?")
-				sb._param = append(sb._param, val)
-			}
-
-			//添加到主键列表
-			//if tagKey == "pk" {
-			//sb.primaryKeys.Set(fmField, val)
-			//}
-
-		}
-
 		//如果设置table标签用则采用table的值，如果已经执行过Table方法了，此标签失效
-		if tagTable != "" && sb._table == "" {
+		if tagTable := field.Tag.Get("table"); tagTable != "" && sb._table == "" {
 			sb._table = tagTable
 		}
+		tagField := dbField(field)
+		if tagField == "" {
+			continue
+		}
+		param, skip := structFieldValue(field, rv.Field(i), field.Tag.Get("empty") == "1")
+		if skip {
+			continue
+		}
+		if hasValueNum > 0 {
+			buf.WriteString(",")
+			valuebuf.WriteString(",")
+		}
+		hasValueNum++
+		buf.WriteString("`")
+		buf.WriteString(tagField)
+		buf.WriteString("`")
+		valuebuf.WriteString("?")
+		sb._insertParam = append(sb._insertParam, param)
 	}
-	valuebuf.WriteString(")")
 	if hasValueNum > 0 {
-		sb._insert = buf.String() + valuebuf.String()
+		sb._insert = "(" + buf.String() + ") VALUES (" + valuebuf.String() + ")"
+	} else {
+		sb._insert = ""
 	}
 }
 
-// 必须输入[]struct []map或者是指针 两者效率差不多
-// 结构体的，time类型要补全
+// 必须输入[]struct、[]*struct、[]map 或它们的指针。
+// 结构体按所有数据库字段插入（零值也写入，保证每行列相同）；map 以第一行的键为列，其余行必须有相同的键。
 func (sb *SQLBuilder) AddMore(s interface{}, addtype ...int) *SQLBuilder {
 	sb.insertScanMore(s)
 	return sb
@@ -673,27 +656,23 @@ func (sb *SQLBuilder) AddMore(s interface{}, addtype ...int) *SQLBuilder {
 
 func (sb *SQLBuilder) insertScanMore(dest interface{}) *SQLBuilder {
 	value := reflect.ValueOf(dest)
-	//vtype := reflect.TypeOf(dest)
-	//valuekind := value.Kind()
-	if value.Kind() == reflect.Ptr && value.Type().Elem().Kind() == reflect.Slice {
-		elemType := value.Type().Elem()
-		if elemType.Elem().Kind() == reflect.Struct { //结构体指针
-			PtrType := elemType.Elem().Elem()
-			PtrValue := reflect.Indirect(value)
-			sb.setInsetMoreBystruct(PtrType, PtrValue)
-		} else if elemType.Elem().Kind() == reflect.Map {
-			PtrValue := reflect.Indirect(value)
-			sb.setInsetMoreByMap(PtrValue)
-		}
-	} else if value.Kind() == reflect.Slice { //结构体,可设置字段时不为空
-		elemType := value.Type().Elem()
-		if elemType.Kind() == reflect.Struct {
-			//PtrValue := reflect.Indirect(value)
-			sb.setInsetMoreBystruct(elemType, value)
-		} else if elemType.Kind() == reflect.Map {
-			//PtrValue := reflect.Indirect(value)
-			sb.setInsetMoreByMap(value)
-		}
+	if value.Kind() == reflect.Ptr {
+		value = reflect.Indirect(value)
+	}
+	if value.Kind() != reflect.Slice {
+		panic("AddMore 参数必须是切片或切片指针")
+	}
+	elemType := value.Type().Elem()
+	if elemType.Kind() == reflect.Ptr {
+		elemType = elemType.Elem()
+	}
+	switch elemType.Kind() {
+	case reflect.Struct:
+		sb.setInsetMoreBystruct(elemType, value)
+	case reflect.Map:
+		sb.setInsetMoreByMap(value)
+	default:
+		panic("AddMore 切片元素必须是 struct、struct 指针或 map")
 	}
 	return sb
 }
@@ -704,72 +683,46 @@ func (sb *SQLBuilder) setInsetMoreBystruct(rt reflect.Type, rv reflect.Value) {
 		panic("Slice 长度必须大于0")
 	}
 	var buf strings.Builder
-	buf.WriteString("(")
-	var valuebuf strings.Builder
-	valuebuf.WriteString(") VALUES (")
-	for i := 0; i < rv.Len(); i++ {
-		// 使用反射获取结构体的值信息
-		structValue := rv.Index(i)
-		var HasInsetNum = 0
-		// 遍历结构体的字段
-		for j := 0; j < structValue.NumField(); j++ {
-			// 获取字段的键名和值
-			//fieldName := rt.Field(i).Name
-			fieldValue := structValue.Field(j).Interface()
-			field := rt.Field(j)
-			tagField := field.Tag.Get("field")
-			tagKey := field.Tag.Get("key")
-			//tagTable := field.Tag.Get("table")
-			tagType := field.Tag.Get("type")
-			tagIsAuto := field.Tag.Get("auto")      //是否为数据库自动字段
-			if tagField != "" && tagIsAuto != "1" { //不属于数据库字段不添加到字段值列表,没设置值的不添加  为保证字段相同，去掉&& !structValue.Field(j).IsZero()
-				//构造字段表map
-				//var fmField string = tagField
-				HasInsetNum++
-
-				if i == 0 {
-					if HasInsetNum != 1 {
-						buf.WriteString(",")
-					}
-					buf.WriteString("`")
-					buf.WriteString(tagField)
-					buf.WriteString("`")
-				}
-				if HasInsetNum != 1 {
-					valuebuf.WriteString(",")
-				}
-				valuebuf.WriteString("?")
-				//if j != structValue.NumField()-1 {
-				//	valuebuf.WriteString(",")
-				//}
-				if field.Type.Kind() == reflect.Struct && field.Type.String() == "time.Time" { //time类型
-					fieldTime := fieldValue.(time.Time)
-					if !fieldTime.IsZero() {
-						if tagType == "date" { //date方式
-							sb._param = append(sb._param, fieldTime.Format("2006-01-02"))
-						} else if tagType == "datetime" { //datetime timestamp方式
-							sb._param = append(sb._param, fieldTime.Format("2006-01-02T15:04:05.999999999"))
-						} else if tagType == "int" { //uinx时间戳方式
-							sb._param = append(sb._param, fieldTime.Unix())
-						}
-					}
-				} else {
-					sb._param = append(sb._param, fieldValue)
-				}
-				//添加到主键列表
-				if tagKey == "pk" {
-					//m.primaryKeys.Set(fmField, val)
-				}
-
-			}
+	var fieldIdx []int
+	for j := 0; j < rt.NumField(); j++ {
+		field := rt.Field(j)
+		if tagTable := field.Tag.Get("table"); tagTable != "" && sb._table == "" {
+			sb._table = tagTable
 		}
-		if i == knum-1 {
-			valuebuf.WriteString(")")
-		} else {
-			valuebuf.WriteString("),(")
+		tagField := dbField(field)
+		if tagField == "" {
+			continue
+		}
+		if len(fieldIdx) > 0 {
+			buf.WriteString(",")
+		}
+		buf.WriteString("`")
+		buf.WriteString(tagField)
+		buf.WriteString("`")
+		fieldIdx = append(fieldIdx, j)
+	}
+	if len(fieldIdx) == 0 {
+		sb._insert = ""
+		return
+	}
+	row := "(" + GenPlaceholders(len(fieldIdx)) + ")"
+	var valuebuf strings.Builder
+	sb._insertParam = make([]interface{}, 0, knum*len(fieldIdx))
+	for i := 0; i < knum; i++ {
+		structValue := reflect.Indirect(rv.Index(i))
+		if !structValue.IsValid() {
+			panic(fmt.Sprintf("AddMore 第%d个元素为 nil", i))
+		}
+		if i > 0 {
+			valuebuf.WriteString(",")
+		}
+		valuebuf.WriteString(row)
+		for _, j := range fieldIdx {
+			param, _ := structFieldValue(rt.Field(j), structValue.Field(j), true)
+			sb._insertParam = append(sb._insertParam, param)
 		}
 	}
-	sb._insert = buf.String() + valuebuf.String()
+	sb._insert = "(" + buf.String() + ") VALUES " + valuebuf.String()
 }
 
 func (sb *SQLBuilder) setInsetMoreByMap(m reflect.Value) {
@@ -777,97 +730,75 @@ func (sb *SQLBuilder) setInsetMoreByMap(m reflect.Value) {
 	if knum == 0 {
 		panic("map 长度必须大于0")
 	}
-	var buf strings.Builder
-	buf.WriteString("(")
-	var valuebuf strings.Builder
-	valuebuf.WriteString(") VALUES (")
-
-	// 以第一个 map 的键序为准，固定列顺序。
-	// Go 的 map 遍历顺序是随机的，若每行各按自身遍历序追加参数，会与列名错位导致数据串位。
-	first := m.Index(0)
-	firstmaplen := first.Len()
-	orderedKeys := make([]reflect.Value, 0, firstmaplen)
-	for _, key := range first.MapKeys() {
-		orderedKeys = append(orderedKeys, key)
+	keys := sortedMapKeys(reflect.Indirect(m.Index(0)))
+	if len(keys) == 0 {
+		panic("切片中的每个map的长度必须大于0且等同")
 	}
-
+	var buf strings.Builder
+	for ik, key := range keys {
+		if ik > 0 {
+			buf.WriteString(",")
+		}
+		buf.WriteString("`")
+		buf.WriteString(mapKeyName(key))
+		buf.WriteString("`")
+	}
+	row := "(" + GenPlaceholders(len(keys)) + ")"
+	var valuebuf strings.Builder
+	sb._insertParam = make([]interface{}, 0, knum*len(keys))
 	for i := 0; i < knum; i++ {
-		// 获取切片中的每个map的值
-		mapValue := m.Index(i)
-		maplen := mapValue.Len() //获取每个切片的长度
-		if maplen == 0 || firstmaplen != maplen {
+		mapValue := reflect.Indirect(m.Index(i))
+		if !mapValue.IsValid() || mapValue.Len() != len(keys) {
 			panic("切片中的每个map的长度必须大于0且等同")
 		}
-		for ik, key := range orderedKeys {
-			if i == 0 { //第一个切片，构造列名
-				buf.WriteString("`")
-				buf.WriteString(key.String())
-				buf.WriteString("`")
-				if ik < firstmaplen-1 {
-					buf.WriteString(",")
-				}
-			}
-			valuebuf.WriteString("?")
-			if ik != firstmaplen-1 {
-				valuebuf.WriteString(",")
-			}
-			val := mapValue.MapIndex(key)
-			if !val.IsValid() { //各行必须包含相同的键，否则会错位
-				panic("切片中的每个map必须包含相同的键: " + key.String())
-			}
-			// 直接以原始类型作为占位参数（支持 int64/float 等，不强制 string）。
-			sb._param = append(sb._param, val.Interface())
+		if i > 0 {
+			valuebuf.WriteString(",")
 		}
-		if i == knum-1 {
-			valuebuf.WriteString(")")
-		} else {
-			valuebuf.WriteString("),(")
+		valuebuf.WriteString(row)
+		for _, key := range keys {
+			v := mapValue.MapIndex(key)
+			if !v.IsValid() {
+				panic(fmt.Sprintf("切片中第%d个map缺少字段[%s]", i, mapKeyName(key)))
+			}
+			sb._insertParam = append(sb._insertParam, v.Interface())
 		}
 	}
-	sb._insert = buf.String() + valuebuf.String()
+	sb._insert = "(" + buf.String() + ") VALUES " + valuebuf.String()
 }
 
-// set("user=?,id=?",username,id)
+// appendUpdate 追加 SET 片段，多次 Set/Sets 会合并为一个 SET 子句
+func (sb *SQLBuilder) appendUpdate(fields string) {
+	if sb._update == "" {
+		sb._update = "SET " + fields
+	} else {
+		sb._update += "," + fields
+	}
+}
+
+// set("user=?,id=?",username,id)，可多次调用，也可与 Sets 混用；与 Where 的先后顺序不影响参数
 func (sb *SQLBuilder) Set(updatestr string, values ...interface{}) *SQLBuilder {
-
 	if updatestr != "" {
-		if sb._where != "" {
-			panic(errors.New("where语句必须再set之后出现"))
+		if strings.Count(updatestr, "?") != len(values) {
+			panic(fmt.Sprintf("Set条件[%s]与参数个数不对应", updatestr))
 		}
-		if sb._update == "" {
-			sb._update = "SET " + updatestr
-		} else {
-			var buf strings.Builder
-			buf.WriteString(",")
-			buf.WriteString(updatestr)
-			sb._update = buf.String()
-		}
-		if len(values) > 0 {
-			sb._param = append(sb._param, values...)
-		}
-
+		sb.appendUpdate(updatestr)
+		sb._setParam = append(sb._setParam, values...)
 	}
 	return sb
 }
 
 // 可以输入map或strcut或者他们的指针，struct效率比map高
 func (sb *SQLBuilder) Sets(dest interface{}) *SQLBuilder {
-	if sb._where != "" {
-		panic(errors.New("where语句必须再set之后出现"))
-	}
 	value := reflect.ValueOf(dest)
 	vtype := reflect.TypeOf(dest)
 	if vtype.Kind() == reflect.Struct { //结构体,可设置字段时不为空
-		rt := reflect.TypeOf(dest)
-		sb.setUpdateBystruct(rt, value)
+		sb.setUpdateBystruct(vtype, value)
 	} else if vtype.Kind() == reflect.Ptr {
 		elemType := value.Type().Elem()
 		if elemType.Kind() == reflect.Struct { //结构体指针
-			PtrValue := reflect.Indirect(value)
-			sb.setUpdateBystruct(elemType, PtrValue)
+			sb.setUpdateBystruct(elemType, reflect.Indirect(value))
 		} else if elemType.Kind() == reflect.Map {
-			PtrValue := reflect.Indirect(value)
-			sb.setUpdateByMap(PtrValue)
+			sb.setUpdateByMap(reflect.Indirect(value))
 		}
 	} else if vtype.Kind() == reflect.Map { //map
 		sb.setUpdateByMap(value)
@@ -881,97 +812,45 @@ func (sb *SQLBuilder) setUpdateByMap(m reflect.Value) {
 		panic("map 长度必须大于0")
 	}
 	var buf strings.Builder
-	buf.WriteString("Set ")
-	keys := m.MapKeys()
-	for i, key := range keys {
-		buf.WriteString(key.String())
-		buf.WriteString("=?")
-		if i != knum-1 {
+	for i, key := range sortedMapKeys(m) {
+		if i > 0 {
 			buf.WriteString(",")
 		}
-		// 原实现硬断言为 string，遇到 int64 等会 panic；直接以原始类型作为占位参数。
-		sb._param = append(sb._param, m.MapIndex(key).Interface())
+		buf.WriteString(mapKeyName(key))
+		buf.WriteString("=?")
+		sb._setParam = append(sb._setParam, m.MapIndex(key).Interface())
 	}
-	if sb._update == "" {
-		sb._update = buf.String()
-	} else {
-		sb._update = "," + buf.String()
-	}
+	sb.appendUpdate(buf.String())
 }
 
 func (sb *SQLBuilder) setUpdateBystruct(rt reflect.Type, rv reflect.Value) {
 	var buf strings.Builder
-	buf.WriteString("Set ")
-	fieldNum := rt.NumField()
-
-	hasValueNum := 0 //是否有设置值
-
-	for i := 0; i < fieldNum; i++ {
+	hasValueNum := 0
+	for i := 0; i < rt.NumField(); i++ {
 		field := rt.Field(i)
-		val := rv.Field(i).Interface()
-		tagField := field.Tag.Get("field")
-		tagTable := field.Tag.Get("table")
-		tagType := field.Tag.Get("type")
-		//tagkey := field.Tag.Get("key")
-		tagallowempty := field.Tag.Get("empty")
-		tagIsAuto := strings.Trim(field.Tag.Get("auto"), " ") //是否为数据库自动字段
-		if tagField != "" && tagIsAuto != "1" {               //不属于数据库字段不添加到字段值列表,没设置值的不添加&& !rv.Field(i).IsZero()
-			if tagallowempty != "1" && rv.Field(i).IsZero() {
-				continue //字段不能为空 但值却为空则跳过
-			}
-
-			if tagallowempty == "1" && rv.Field(i).IsZero() {
-				continue //字段可用为空且值也为空则跳过
-			}
-
-			if field.Type.Kind() == reflect.Struct && field.Type.String() == "time.Time" { //time类型
-				fieldTime := val.(time.Time)
-				if !fieldTime.IsZero() {
-					if tagType == "date" { //date方式
-						sb._param = append(sb._param, fieldTime.Format("2006-01-02"))
-					} else if (tagType == "datetime") || (tagType == "timestamp") { //datetime timestamp方式
-						sb._param = append(sb._param, fieldTime.Format("2006-01-02T15:04:05.999999999"))
-					} else if tagType == "int" { //uinx时间戳方式
-						sb._param = append(sb._param, fieldTime.Unix())
-					}
-					hasValueNum++
-					//构造字段表map
-					var fmField string = tagField
-					if hasValueNum != 1 {
-						buf.WriteString(",")
-					}
-
-					buf.WriteString(fmField)
-					buf.WriteString("=?")
-				}
-			} else {
-				hasValueNum++
-				//构造字段表map
-				var fmField string = tagField
-				if hasValueNum != 1 {
-					buf.WriteString(",")
-				}
-
-				buf.WriteString(fmField)
-				buf.WriteString("=?")
-				sb._param = append(sb._param, val)
-			}
-		}
 		//如果设置table标签用则采用table的值，如果已经执行过Table方法了，此标签失效
-		if tagTable != "" && sb._table == "" {
+		if tagTable := field.Tag.Get("table"); tagTable != "" && sb._table == "" {
 			sb._table = tagTable
 		}
+		tagField := dbField(field)
+		if tagField == "" {
+			continue
+		}
+		param, skip := structFieldValue(field, rv.Field(i), field.Tag.Get("empty") == "1")
+		if skip {
+			continue
+		}
+		if hasValueNum > 0 {
+			buf.WriteString(",")
+		}
+		hasValueNum++
+		buf.WriteString(tagField)
+		buf.WriteString("=?")
+		sb._setParam = append(sb._setParam, param)
 	}
 	if hasValueNum > 0 {
-		if sb._update == "" {
-			sb._update = buf.String()
-		} else {
-			sb._update = "," + buf.String()
-		}
+		sb.appendUpdate(buf.String())
 	}
-	//if hasValueNum != fieldNum {
-	//sb._update = sb._update[:len(sb._update)-1]
-	//}
 }
 
 func (sb *SQLBuilder) ReSet() *SQLBuilder {
@@ -990,7 +869,13 @@ func (sb *SQLBuilder) ReSet() *SQLBuilder {
 	sb._forUpdate = false
 	sb._dkuStr = ""
 	sb._methodtype = 6          //select
-	sb._param = sb._param[:0:0] //清空参数列表
+	sb._param = nil //清空参数列表
+	sb._joinParam = nil
+	sb._whereParam = nil
+	sb._havingParam = nil
+	sb._setParam = nil
+	sb._insertParam = nil
+	sb._dkuParam = nil
 	if sb.isAutoCommit {        //非事物
 		sb.tx = nil
 	}
@@ -1043,32 +928,20 @@ func (sb *SQLBuilder) ShowSql() (string, []interface{}, error) {
 		sql, err = sb.GetQuerySQL()
 	}
 	sb._SQL = sql
+	sb._param = sb.GetQueryParams()
 	return sql, sb._param, err
 }
 
 func (sb *SQLBuilder) getSql() (string, []interface{}, error) {
-	var sql string
-	var err error
-	switch sb._methodtype {
-	case 1, 2, 3:
-		sql, err = sb.GetInsertSQL()
-	case 4:
-		sql, err = sb.GetUpdateSQL()
-	case 5:
-		sql, err = sb.GetDeleteSQL()
-	case 6:
-		sql, err = sb.GetQuerySQL()
-	}
-	sb._SQL = sql
-	return sql, sb._param, err
+	return sb.ShowSql()
 }
 
 // 查询单行，这里error只提示数据库没有实例,没法判断有没数据，必须调用row.scan来获取err，err == sql.ErrNoRows
 func (sb *SQLBuilder) QueryRow(sqlstr string, args ...interface{}) (*sql.Row, error) {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
+	sb.Log.Start()
+	sb._SQL, sb._param = sqlstr, args
 	return sb._QueryRow(sqlstr, args...)
 
 }
@@ -1095,10 +968,10 @@ func (sb *SQLBuilder) _QueryRow(sqlstr string, args ...interface{}) (row *sql.Ro
 
 // 数据库查询操作（select） 冲数据库,主要一定要close释放
 func (sb *SQLBuilder) Query(sqlstr string, args ...interface{}) (*sql.Rows, error) {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
+	sb.Log.Start()
+	sb._SQL, sb._param = sqlstr, args
 	return sb._Query(sqlstr, args...)
 }
 
@@ -1134,23 +1007,12 @@ func (sb *SQLBuilder) Execute(sqlstr string, args ...interface{}) (res sql.Resul
 		}
 	}()
 	if !sb.isAutoCommit && sb.tx != nil { //事物
-		stmt, err := sb.tx.Prepare(sqlstr)
-		if err != nil {
-			return nil, err
-		}
-		defer stmt.Close()
-		return stmt.Exec(args...)
-
+		return sb.tx.Exec(sqlstr, args...)
 	} else {
 		if sb.dbmodel == nil || sb.dbmodel.writer == nil {
 			return nil, errors.New("主数据库未能获取到实例")
 		}
-		stmt, err := sb.dbmodel.writer.Prepare(sqlstr)
-		if err != nil {
-			return nil, err
-		}
-		defer stmt.Close()
-		return stmt.Exec(args...)
+		return sb.dbmodel.writer.Exec(sqlstr, args...)
 	}
 }
 
@@ -1175,11 +1037,7 @@ func (sb *SQLBuilder) Exec(sqlstr string, args ...interface{}) (res sql.Result, 
 // 把返回值直接赋值到多个参数,参数不能小于1个,和字段对应,必须指针
 func (sb *SQLBuilder) Get(dest ...interface{}) error {
 	if len(dest) > 0 {
-		if sb.isAutoCommit {
-			defer sb.Free()
-		} else {
-			defer sb.ReSet()
-		}
+		defer sb.ReSet()
 		defer sb.Log.ShowLog()
 		sb._methodtype = 6
 		sb.Limit(0, 1)
@@ -1201,11 +1059,7 @@ func (sb *SQLBuilder) Get(dest ...interface{}) error {
 
 // 这个速度快 用指针 没有数据会返回错误sql.ErrNoRows
 func (sb *SQLBuilder) Find(dest interface{}) error {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	} else {
-		defer sb.ReSet()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
 	value := reflect.ValueOf(dest)
 	//vtype := reflect.TypeOf(dest)
@@ -1230,18 +1084,14 @@ func (sb *SQLBuilder) Find(dest interface{}) error {
 
 // 这个速度快 用指针,要判断有没数据必须 判断dest ！=nil 或者 len（dest）>0
 func (sb *SQLBuilder) FindList(dest interface{}) error {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	} else {
-		defer sb.ReSet()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
 	value := reflect.ValueOf(dest)
 	vtype := reflect.TypeOf(dest)
 	//rt := rv.Type()
 	if vtype.Kind() == reflect.Ptr && value.Type().Elem().Kind() == reflect.Slice {
 		// 预扩容：当使用 Limit 时，可显著减少 slice 扩容拷贝成本
-		if hint := sb.limitHint(); hint > 0 {
+		if hint := min(sb.limitHint(), 1024); hint > 0 {
 			direct := reflect.Indirect(value)
 			if direct.Kind() == reflect.Slice && direct.Cap() < hint {
 				direct.Set(reflect.MakeSlice(direct.Type(), 0, hint))
@@ -1267,11 +1117,7 @@ func (sb *SQLBuilder) FindList(dest interface{}) error {
 
 // 数据量大时必须用select，用其他的和原生差距一倍以上  内存小，必须close
 func (sb *SQLBuilder) Select() (*sql.Rows, error) {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	} else {
-		defer sb.ReSet()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
 	sb._methodtype = 6
 	sqlstr, params, err := sb.getSql()
@@ -1283,11 +1129,7 @@ func (sb *SQLBuilder) Select() (*sql.Rows, error) {
 }
 
 func (sb *SQLBuilder) Delete() (int64, error) {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	} else {
-		defer sb.ReSet()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
 	sb._methodtype = 5
 	sqlstr, params, err := sb.getSql()
@@ -1306,11 +1148,7 @@ func (sb *SQLBuilder) Delete() (int64, error) {
 
 // typ参数，1=insert，2=IGNORE INTO，3=REPLACE INSERT
 func (sb *SQLBuilder) Insert(lastinsertid bool) (int64, error) {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	} else {
-		defer sb.ReSet()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
 	sb._methodtype = 1
 	sqlstr, params, err := sb.getSql()
@@ -1331,11 +1169,7 @@ func (sb *SQLBuilder) Insert(lastinsertid bool) (int64, error) {
 }
 
 func (sb *SQLBuilder) ReplaceInsert(lastinsertid bool) (int64, error) {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	} else {
-		defer sb.ReSet()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
 	sb._methodtype = 3
 	sqlstr, params, err := sb.getSql()
@@ -1356,11 +1190,7 @@ func (sb *SQLBuilder) ReplaceInsert(lastinsertid bool) (int64, error) {
 }
 
 func (sb *SQLBuilder) IgnoreInsert(lastinsertid bool) (int64, error) {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	} else {
-		defer sb.ReSet()
-	}
+	defer sb.ReSet()
 	defer sb.Log.ShowLog()
 	sb._methodtype = 2
 	sqlstr, params, err := sb.getSql()
@@ -1382,11 +1212,7 @@ func (sb *SQLBuilder) IgnoreInsert(lastinsertid bool) (int64, error) {
 
 // 要注意set和where的顺序，避免参数混乱
 func (sb *SQLBuilder) Update() (int64, error) {
-	if sb.isAutoCommit {
-		defer sb.Free()
-	} else {
-		defer sb.ReSet()
-	}
+	defer sb.ReSet()
 	//starttime := time.Now()
 	defer sb.Log.ShowLog()
 	sb._methodtype = 4

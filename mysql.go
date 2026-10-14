@@ -92,8 +92,11 @@ func Init(driver string, conf SqlOneConf) (db *sql.DB, err error) {
 	db.SetMaxIdleConns(conf.MaxIdleConns) //设置闲置的连接数,当开启的一个连接使用完成后可以放在池里等候下一次使用
 	db.SetConnMaxIdleTime(conf.ConnMaxIdleTime)
 	db.SetConnMaxLifetime(conf.ConnMaxLifetime)
-	err = db.Ping()
-	return db, err
+	if err = db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 // 数据库连接判断，连接未中断返回nil

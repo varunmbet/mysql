@@ -325,19 +325,17 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 	if !scannable {
 		var values []interface{}
 		var m *reflectx.Mapper
-		unsafe := false
 
-		switch r := rows.(type) {
+		switch rows.(type) {
 		case *Rows:
-			m = r.Mapper
-			unsafe = r.unsafe
+			m = rows.(*Rows).Mapper
 		default:
 			m = mapper()
 		}
 
 		fields := m.TraversalsByName(base, columns)
 		// if we are not unsafe and are missing fields, return an error
-		if f, err := missingFields(fields); err != nil && !unsafe {
+		if f, err := missingFields(fields); err != nil {
 			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
 		}
 		values = make([]interface{}, len(columns))

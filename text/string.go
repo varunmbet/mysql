@@ -248,21 +248,5 @@ func StringToInt(str string) int {
 
 //int64转换为字符串
 func Int64ToString(n int64) string {
-	buf := [11]byte{}
-	pos := len(buf)
-	signed := n < 0
-	if signed {
-		n = -n
-	}
-	for {
-		pos--
-		buf[pos], n = '0'+byte(n%10), n/10
-		if n == 0 {
-			if signed {
-				pos--
-				buf[pos] = '-'
-			}
-			return string(buf[pos:])
-		}
-	}
+	return strconv.FormatInt(n, 10)
 }
