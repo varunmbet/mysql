@@ -52,7 +52,7 @@ func main() {
 	defer db.Close()
 
 	sb := db.Orm()
-	defer sb.Free() // 强烈建议：用完归还到 pool
+	defer sb.Free() // 用完归还到 pool；只由 Orm() 的调用方调用
 
 	var id int64
 	err = sb.Table("users").Where("name=?", "alice").Get(&id)
@@ -132,14 +132,25 @@ for rows.Next() {
 #### 3) 写入（Insert/IgnoreInsert/ReplaceInsert）
 
 ```go
-// 先调用 Sets / SetMap / SetStruct 等组装插入内容（具体方法见 builder.go）
+// AddOne 接受 map / struct（或指针）；AddMore 接受 []map / []struct / []*struct
 id, err := db.Orm().
 	Table("users").
-	Sets(map[string]interface{}{"name": "alice"}).
+	AddOne(map[string]interface{}{"name": "alice"}).
 	Insert(true) // true=返回LastInsertId; false=返回RowsAffected
 _ = id
 _ = err
+
+// 冲突时更新（只对 Insert 生效）
+_, err = db.Orm().Table("users").
+	AddOne(map[string]interface{}{"id": 1, "name": "alice"}).
+	OnDku("name=VALUES(name)").
+	Insert(false)
 ```
+
+struct 标签：`field:"列名"`，`auto:"1"` 表示自增等数据库自动字段（不写入），`table:"表名"` 在未调用 `Table()` 时生效，
+`type:"date|datetime|timestamp|int"` 控制 `time.Time` 的写入格式（不设置则交给驱动处理）。
+单行写入/更新默认跳过零值字段；加 `empty:"1"` 的字段零值也会写入（`time.Time` 零值写 NULL）。
+`AddMore` 结构体按全部数据库字段逐行写入（零值也写），map 以第一行的键为列，其余行必须有相同的键。
 
 #### 4) 更新/删除（Update/Delete）
 
@@ -219,8 +230,28 @@ if err != nil {
 defer db.Close()
 ```
 
+### builder 的归还规则
+
+- `Free()` 只由取得 builder 的一方调用：`db.Orm()` 的调用方，或 `db.Transaction`（内部已处理）
+- `Get/Find/FindList/Select/QueryRow/Query/Insert/Update/Delete` 等执行完只清空构建状态，**不会**自行归还 pool，
+  同一个 builder 可以继续构建下一条语句
+- 不调用 `Free()` 的写法（如 `db.Orm().Table(...).Find(...)`）依然正确，只是该对象不会被复用，由 GC 回收
+
+### 条件与参数
+
+- `Where / WhereIn / JoinRaw / Having / Set / Sets / OnDku` 的参数按子句分别保存，生成 SQL 时按语句中的位置拼接，链式调用顺序不影响参数对应
+- `Set / Sets` 可多次调用、可混用，合并为一个 `SET` 子句；`Having` 多次调用以 `AND` 连接
+- `WhereIn("id", ...)` 接受多个值、切片或切片指针；值为空时生成 `1=0`（`NotIn` 为 `1=1`），不会退化成只剩字段名的条件
+
 ### 破坏性变更说明（与旧版本相比）
 
 - `NewDb` 已改为 `func NewDb(config SqlConf) (*DbModel, error)`，连接失败不再 `panic`
 - `ConnMaxIdleTime/ConnMaxLifetime` 类型改为 `time.Duration`，避免单位误用
 - `Get()` 遇到查询执行错误会返回 `err`（不再静默 `nil`）
+- 执行方法不再自动 `Free()`（见“builder 的归还规则”）。旧版在调用方也 `defer sb.Free()` 时会把同一对象两次放回 pool，
+  第二次可能回滚别的 goroutine 正在进行的事务
+- `WhereIn` 传空值：旧版生成 `WHERE id`（`Delete` 时会删掉所有 id 非 0 的行），现在为恒假条件
+- `Having` 不再要求先调用 `GroupBy`；`Set` 的 `?` 个数与参数不一致时 panic（与 `Where` 一致）
+- struct 的 `empty:"1"` 标签生效（零值会写入）；未设置 `type` 的 `time.Time` 字段现在会正确传参
+- map 写入/更新的列按键名排序，SQL 文本稳定
+- `text` 包日志不再修改标准库 `log` 的全局输出、不再在日志文件打不开时 `os.Exit`
